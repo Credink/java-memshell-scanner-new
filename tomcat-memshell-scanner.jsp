@@ -274,7 +274,8 @@
             }
             cur = next;
         }
-        return request;
+        // 即使未识别到 Catalina 类名，也返回解包后的最内层对象
+        return cur == null ? request : cur;
     }
 
     public static Object servletContextOf(HttpServletRequest request) throws Exception {
@@ -1371,20 +1372,27 @@
         Class<?> execIface = tryClass("java.util.concurrent.Executor");
         Object fresh = null;
         Constructor<?>[] ctors = tpe.getConstructors();
-        for (int i = 0; i < ctors.length; i++) {
-            Class<?>[] pts = ctors[i].getParameterTypes();
-            try {
-                if (pts.length == 7 && bq != null && tf != null && rh != null) {
-                    fresh = ctors[i].newInstance(Integer.valueOf(core), Integer.valueOf(max),
-                            Long.valueOf(keepAlive), TimeUnit.MILLISECONDS, queue, threadFactory, handler);
-                    break;
+        // 优先 7 参构造（保留 RejectedExecutionHandler），再回退 6 参
+        for (int pass = 0; pass < 2 && fresh == null; pass++) {
+            int want = pass == 0 ? 7 : 6;
+            for (int i = 0; i < ctors.length; i++) {
+                Class<?>[] pts = ctors[i].getParameterTypes();
+                if (pts.length != want) {
+                    continue;
                 }
-                if (pts.length == 6 && bq != null && tf != null) {
-                    fresh = ctors[i].newInstance(Integer.valueOf(core), Integer.valueOf(max),
-                            Long.valueOf(keepAlive), TimeUnit.MILLISECONDS, queue, threadFactory);
-                    break;
+                try {
+                    if (want == 7 && bq != null && tf != null && rh != null) {
+                        fresh = ctors[i].newInstance(Integer.valueOf(core), Integer.valueOf(max),
+                                Long.valueOf(keepAlive), TimeUnit.MILLISECONDS, queue, threadFactory, handler);
+                        break;
+                    }
+                    if (want == 6 && bq != null && tf != null) {
+                        fresh = ctors[i].newInstance(Integer.valueOf(core), Integer.valueOf(max),
+                                Long.valueOf(keepAlive), TimeUnit.MILLISECONDS, queue, threadFactory);
+                        break;
+                    }
+                } catch (Exception ignored) {
                 }
-            } catch (Exception ignored) {
             }
         }
         if (fresh == null) {
@@ -1547,6 +1555,54 @@
         return "?action=kill&" + query;
     }
 %>
+<%-- dump 必须在任何 HTML 输出之前，避免 JspWriter 与 OutputStream 冲突 --%>
+<%
+    if ("dump".equals(request.getParameter("action")) && request.getParameter("className") != null) {
+        String __dumpClass = request.getParameter("className");
+        try {
+            Class<?> __clazz = loadClassFlexible(__dumpClass);
+            byte[] __bytes = dumpClassBytes(__clazz);
+            response.reset();
+            response.setContentType("application/octet-stream");
+            String __filename = __clazz.getSimpleName();
+            if (__filename == null || __filename.length() == 0 || "null".equals(__filename)) {
+                __filename = "MemShell";
+            }
+            __filename = __filename + ".class";
+            String __agent = request.getHeader("User-Agent");
+            if (__agent != null && __agent.toLowerCase().contains("chrome")) {
+                response.setHeader("Content-Disposition",
+                        "attachment;filename=" + new String(__filename.getBytes("UTF-8"), "ISO8859-1"));
+            } else {
+                response.setHeader("Content-Disposition",
+                        "attachment;filename=" + URLEncoder.encode(__filename, "UTF-8"));
+            }
+            Object __sos = invokeName(response, "getOutputStream");
+            Method __write = findMethod(__sos.getClass(), "write", byte[].class);
+            if (__write == null) {
+                __write = findMethod(__sos.getClass(), "write", byte[].class, int.class, int.class);
+            }
+            if (__write == null) {
+                throw new IllegalStateException("OutputStream.write 不可用");
+            }
+            if (__write.getParameterTypes().length == 1) {
+                __write.invoke(__sos, new Object[]{__bytes});
+            } else {
+                __write.invoke(__sos, new Object[]{__bytes, Integer.valueOf(0), Integer.valueOf(__bytes.length)});
+            }
+            try {
+                invokeName(__sos, "flush");
+            } catch (Exception ignored) {
+            }
+        } catch (Exception __e) {
+            response.reset();
+            response.setContentType("text/html;charset=UTF-8");
+            out.write("<h3>dump 失败</h3><pre>" + html(__e.toString()) + "</pre>");
+            out.write("<p>可使用 Arthas：jad --source-only " + html(__dumpClass) + "</p>");
+        }
+        return;
+    }
+%>
 <html>
 <head>
     <title>tomcat-memshell-scanner <%=VERSION%></title>
@@ -1622,62 +1678,6 @@
         return;
     }
 
-    if ("dump".equals(action) && request.getParameter("className") != null) {
-        String className = request.getParameter("className");
-        try {
-            try {
-                out.clear();
-            } catch (Exception ignored) {
-            }
-            Class<?> clazz = loadClassFlexible(className);
-            byte[] classBytes = dumpClassBytes(clazz);
-            response.resetBuffer();
-            response.setContentType("application/octet-stream");
-            String filename = clazz.getSimpleName();
-            if (filename == null || filename.length() == 0 || "null".equals(filename)) {
-                filename = "MemShell";
-            }
-            filename = filename + ".class";
-            String agent = request.getHeader("User-Agent");
-            if (agent != null && agent.toLowerCase().contains("chrome")) {
-                response.setHeader("Content-Disposition",
-                        "attachment;filename=" + new String(filename.getBytes("UTF-8"), "ISO8859-1"));
-            } else {
-                response.setHeader("Content-Disposition",
-                        "attachment;filename=" + URLEncoder.encode(filename, "UTF-8"));
-            }
-            // 避免依赖 ServletOutputStream 编译期类型名差异：反射写出
-            Object sos = invokeName(response, "getOutputStream");
-            Method write = findMethod(sos.getClass(), "write", byte[].class);
-            if (write == null) {
-                write = findMethod(sos.getClass(), "write", byte[].class, int.class, int.class);
-            }
-            if (write == null) {
-                throw new IllegalStateException("OutputStream.write 不可用");
-            }
-            if (write.getParameterTypes().length == 1) {
-                write.invoke(sos, new Object[]{classBytes});
-            } else {
-                write.invoke(sos, new Object[]{classBytes, Integer.valueOf(0), Integer.valueOf(classBytes.length)});
-            }
-            try {
-                invokeName(sos, "flush");
-            } catch (Exception ignored) {
-            }
-            return;
-        } catch (Exception e) {
-            try {
-                response.reset();
-            } catch (Exception ignored) {
-            }
-            response.setContentType("text/html;charset=UTF-8");
-            out.write("<h3>dump 失败</h3><pre class=\"err\">" + html(e.toString()) + "</pre>");
-            out.write("<p>内存中动态定义的类可能无法通过 ClassLoader/BCEL dump，可使用 Arthas：</p>");
-            out.write("<pre>$ java -jar arthas-boot.jar\n$ jad --source-only " + html(className) + "</pre>");
-            out.write("<p><a href=\"" + html(self) + "\">返回</a></p>");
-            return;
-        }
-    }
 %>
 <h2>Tomcat MemShell Scanner <%=VERSION%></h2>
 <div class="meta">

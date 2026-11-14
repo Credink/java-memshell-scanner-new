@@ -1133,6 +1133,41 @@
         return "?action=kill&" + q;
     }
 %>
+<%-- dump 必须在任何 HTML 输出之前 --%>
+<%
+    if ("dump".equals(request.getParameter("action")) && request.getParameter("className") != null) {
+        String __dumpClass = request.getParameter("className");
+        try {
+            Class<?> __clazz = loadClassFlexible(__dumpClass);
+            byte[] __bytes = dumpClassBytes(__clazz);
+            response.reset();
+            response.setContentType("application/octet-stream");
+            String __filename = __clazz.getSimpleName();
+            if (__filename == null || __filename.length() == 0) {
+                __filename = "MemShell";
+            }
+            __filename = __filename + ".class";
+            response.setHeader("Content-Disposition",
+                    "attachment;filename=" + URLEncoder.encode(__filename, "UTF-8"));
+            Object __sos = invokeName(response, "getOutputStream");
+            Method __write = findCompatibleMethod(__sos.getClass(), "write", __bytes);
+            if (__write == null) {
+                __write = findCompatibleMethod(__sos.getClass(), "write", __bytes,
+                        Integer.valueOf(0), Integer.valueOf(__bytes.length));
+                __write.invoke(__sos, new Object[]{__bytes, Integer.valueOf(0), Integer.valueOf(__bytes.length)});
+            } else if (__write.getParameterTypes().length == 1) {
+                __write.invoke(__sos, new Object[]{__bytes});
+            } else {
+                __write.invoke(__sos, new Object[]{__bytes, Integer.valueOf(0), Integer.valueOf(__bytes.length)});
+            }
+        } catch (Exception __e) {
+            response.reset();
+            response.setContentType("text/html;charset=UTF-8");
+            out.write("<h3>dump 失败</h3><pre>" + html(__e.toString()) + "</pre>");
+        }
+        return;
+    }
+%>
 <html>
 <head>
     <title>weblogic-memshell-scanner <%=VERSION%></title>
@@ -1192,45 +1227,6 @@
         return;
     }
 
-    if ("dump".equals(action) && request.getParameter("className") != null) {
-        String className = request.getParameter("className");
-        try {
-            try {
-                out.clear();
-            } catch (Exception ignored) {
-            }
-            Class<?> clazz = loadClassFlexible(className);
-            byte[] bytes = dumpClassBytes(clazz);
-            response.resetBuffer();
-            response.setContentType("application/octet-stream");
-            String filename = clazz.getSimpleName();
-            if (filename == null || filename.length() == 0) {
-                filename = "MemShell";
-            }
-            filename = filename + ".class";
-            response.setHeader("Content-Disposition", "attachment;filename=" + URLEncoder.encode(filename, "UTF-8"));
-            Object sos = invokeName(response, "getOutputStream");
-            Method write = findCompatibleMethod(sos.getClass(), "write", bytes);
-            if (write == null) {
-                write = findCompatibleMethod(sos.getClass(), "write", bytes, Integer.valueOf(0), Integer.valueOf(bytes.length));
-                write.invoke(sos, new Object[]{bytes, Integer.valueOf(0), Integer.valueOf(bytes.length)});
-            } else if (write.getParameterTypes().length == 1) {
-                write.invoke(sos, new Object[]{bytes});
-            } else {
-                write.invoke(sos, new Object[]{bytes, Integer.valueOf(0), Integer.valueOf(bytes.length)});
-            }
-            return;
-        } catch (Exception e) {
-            try {
-                response.reset();
-            } catch (Exception ignored) {
-            }
-            response.setContentType("text/html;charset=UTF-8");
-            out.write("<h3>dump 失败</h3><pre class=\"err\">" + html(e.toString()) + "</pre>");
-            out.write("<p><a href=\"" + html(self) + "\">返回</a></p>");
-            return;
-        }
-    }
 %>
 <h2>WebLogic MemShell Scanner <%=VERSION%></h2>
 <div class="meta">
