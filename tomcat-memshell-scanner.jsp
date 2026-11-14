@@ -10,14 +10,36 @@
 <%@ page import="java.util.concurrent.TimeUnit" %>
 <%@ page contentType="text/html;charset=UTF-8" language="java" %>
 <%!
-    public static final String VERSION = "0.2.0";
+    public static final String VERSION = "0.2.1";
+
+    /** JDK9+ 优先 trySetAccessible，避免直接 setAccessible 在部分版本行为不一致 */
+    public static boolean openAccess(Object accessible) {
+        if (accessible == null) {
+            return false;
+        }
+        try {
+            Method trySet = accessible.getClass().getMethod("trySetAccessible");
+            Object ok = trySet.invoke(accessible);
+            if (Boolean.TRUE.equals(ok)) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Method setAcc = accessible.getClass().getMethod("setAccessible", boolean.class);
+            setAcc.invoke(accessible, Boolean.TRUE);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
 
     public static Field findField(Class<?> clazz, String name) {
         Class<?> c = clazz;
         while (c != null && c != Object.class) {
             try {
                 Field f = c.getDeclaredField(name);
-                f.setAccessible(true);
+                openAccess(f);
                 return f;
             } catch (NoSuchFieldException ignored) {
                 c = c.getSuperclass();
@@ -34,7 +56,13 @@
         if (f == null) {
             throw new NoSuchFieldException(obj.getClass().getName() + "." + name);
         }
-        return f.get(obj);
+        try {
+            return f.get(obj);
+        } catch (Exception e) {
+            // JDK16+ 强封装常见于 java.base 内部字段（Thread/Timer）
+            throw new IllegalAccessException(obj.getClass().getName() + "." + name
+                    + " 无法读取（可能被 JDK 模块封装限制）: " + e);
+        }
     }
 
     public static void setFieldValue(Object obj, String name, Object value) throws Exception {
@@ -46,35 +74,243 @@
     }
 
     public static Method findMethod(Class<?> clazz, String name, Class<?>... params) {
+        if (clazz == null) {
+            return null;
+        }
+        Class<?>[] p = params == null ? new Class[0] : params;
         Class<?> c = clazz;
         while (c != null && c != Object.class) {
             try {
-                Method m = c.getDeclaredMethod(name, params);
-                m.setAccessible(true);
+                Method m = c.getDeclaredMethod(name, p);
+                openAccess(m);
                 return m;
             } catch (NoSuchMethodException ignored) {
                 c = c.getSuperclass();
             }
         }
+        // public / 接口方法
+        try {
+            Method m = clazz.getMethod(name, p);
+            openAccess(m);
+            return m;
+        } catch (NoSuchMethodException ignored) {
+        }
+        for (Class<?> iface : clazz.getInterfaces()) {
+            Method m = findMethod(iface, name, p);
+            if (m != null) {
+                return m;
+            }
+        }
         return null;
+    }
+
+    /** 按方法名 + 实参类型兼容性查找（参数类随 Tomcat 版本变化时更稳） */
+    public static Method findCompatibleMethod(Class<?> clazz, String name, Object... args) {
+        if (clazz == null) {
+            return null;
+        }
+        int argc = args == null ? 0 : args.length;
+        List<Method> candidates = new ArrayList<Method>();
+        Class<?> c = clazz;
+        while (c != null && c != Object.class) {
+            Method[] declared = c.getDeclaredMethods();
+            for (int i = 0; i < declared.length; i++) {
+                if (name.equals(declared[i].getName()) && declared[i].getParameterTypes().length == argc) {
+                    candidates.add(declared[i]);
+                }
+            }
+            c = c.getSuperclass();
+        }
+        Method[] publics = clazz.getMethods();
+        for (int i = 0; i < publics.length; i++) {
+            if (name.equals(publics[i].getName()) && publics[i].getParameterTypes().length == argc) {
+                candidates.add(publics[i]);
+            }
+        }
+        for (Method m : candidates) {
+            Class<?>[] pts = m.getParameterTypes();
+            boolean ok = true;
+            for (int i = 0; i < argc; i++) {
+                if (args[i] == null) {
+                    if (pts[i].isPrimitive()) {
+                        ok = false;
+                        break;
+                    }
+                    continue;
+                }
+                if (!wrapType(pts[i]).isAssignableFrom(args[i].getClass())
+                        && !pts[i].isInstance(args[i])) {
+                    // 基本类型装箱
+                    if (!(pts[i].isPrimitive() && wrapType(pts[i]).isInstance(args[i]))) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (ok) {
+                openAccess(m);
+                return m;
+            }
+        }
+        return null;
+    }
+
+    public static Class<?> wrapType(Class<?> t) {
+        if (!t.isPrimitive()) {
+            return t;
+        }
+        if (t == int.class) return Integer.class;
+        if (t == long.class) return Long.class;
+        if (t == boolean.class) return Boolean.class;
+        if (t == byte.class) return Byte.class;
+        if (t == short.class) return Short.class;
+        if (t == char.class) return Character.class;
+        if (t == float.class) return Float.class;
+        if (t == double.class) return Double.class;
+        if (t == void.class) return Void.class;
+        return t;
     }
 
     public static Object invoke(Object obj, String method, Class<?>[] params, Object... args) throws Exception {
         Method m = findMethod(obj.getClass(), method, params);
+        if (m == null) {
+            m = findCompatibleMethod(obj.getClass(), method, args);
+        }
         if (m == null) {
             throw new NoSuchMethodException(obj.getClass().getName() + "." + method);
         }
         return m.invoke(obj, args);
     }
 
+    public static Object invokeName(Object obj, String method, Object... args) throws Exception {
+        Method m = findCompatibleMethod(obj.getClass(), method, args);
+        if (m == null) {
+            throw new NoSuchMethodException(obj.getClass().getName() + "." + method + " (" + (args == null ? 0 : args.length) + " args)");
+        }
+        return m.invoke(obj, args);
+    }
+
     public static Class<?> tryClass(String... names) {
+        ClassLoader ctx = null;
+        try {
+            ctx = Thread.currentThread().getContextClassLoader();
+        } catch (Throwable ignored) {
+        }
         for (String n : names) {
+            if (n == null) {
+                continue;
+            }
+            try {
+                if (ctx != null) {
+                    return Class.forName(n, false, ctx);
+                }
+            } catch (Throwable ignored) {
+            }
             try {
                 return Class.forName(n);
             } catch (Throwable ignored) {
             }
         }
         return null;
+    }
+
+    public static Class<?> loadClassFlexible(String className) throws ClassNotFoundException {
+        if (className == null || className.length() == 0) {
+            throw new ClassNotFoundException("empty");
+        }
+        ClassLoader[] loaders = new ClassLoader[]{
+                Thread.currentThread().getContextClassLoader(),
+                MemShellScannerHelpers.class.getClassLoader(),
+                ClassLoader.getSystemClassLoader()
+        };
+        for (int i = 0; i < loaders.length; i++) {
+            if (loaders[i] == null) {
+                continue;
+            }
+            try {
+                return Class.forName(className, false, loaders[i]);
+            } catch (ClassNotFoundException ignored) {
+            }
+        }
+        return Class.forName(className);
+    }
+
+    /** 避免在声明块依赖具体 JspWriter 包名（javax / jakarta） */
+    public static void writeOut(Object out, String s) throws Exception {
+        if (out == null || s == null) {
+            return;
+        }
+        if (out instanceof Writer) {
+            ((Writer) out).write(s);
+            return;
+        }
+        invokeName(out, "write", s);
+    }
+
+    /**
+     * 解包 Spring/Filter 的 RequestWrapper，找到 Catalina Request / 真实 Facade。
+     */
+    public static Object unwrapToCatalinaRequest(Object request) {
+        Object cur = request;
+        for (int depth = 0; depth < 12 && cur != null; depth++) {
+            String cn = cur.getClass().getName();
+            if (cn.startsWith("org.apache.catalina.connector.Request")
+                    || cn.equals("org.apache.catalina.connector.RequestFacade")) {
+                return cur;
+            }
+            Object next = null;
+            try {
+                next = getFieldValue(cur, "request");
+            } catch (Exception ignored) {
+            }
+            if (next == null) {
+                try {
+                    next = invokeName(cur, "getRequest");
+                } catch (Exception ignored) {
+                }
+            }
+            if (next == null || next == cur) {
+                break;
+            }
+            cur = next;
+        }
+        return request;
+    }
+
+    public static Object servletContextOf(HttpServletRequest request) throws Exception {
+        // 不直接调用 request.getServletContext()：Servlet 2.5 / 部分包装器可能没有
+        try {
+            Method m = findCompatibleMethod(request.getClass(), "getServletContext");
+            if (m != null) {
+                Object sc = m.invoke(request);
+                if (sc != null) {
+                    return sc;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            Object session = invokeName(request, "getSession", Boolean.FALSE);
+            if (session == null) {
+                session = invokeName(request, "getSession", Boolean.TRUE);
+            }
+            if (session != null) {
+                return invokeName(session, "getServletContext");
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            Object cfg = invokeName(request, "getServletConfig");
+            if (cfg != null) {
+                return invokeName(cfg, "getServletContext");
+            }
+        } catch (Exception ignored) {
+        }
+        throw new IllegalStateException("无法获取 ServletContext");
+    }
+
+    // 供 loadClassFlexible 取 JSP 生成类 ClassLoader
+    public static class MemShellScannerHelpers {
     }
 
     public static boolean isInstance(Object obj, String... classNames) {
@@ -112,23 +348,48 @@
         return cl.getClass().getName() + "@" + Integer.toHexString(System.identityHashCode(cl));
     }
 
+    public static boolean isStandardContext(Object o) {
+        if (o == null) {
+            return false;
+        }
+        String n = o.getClass().getName();
+        return n.contains("StandardContext") || isInstance(o, "org.apache.catalina.core.StandardContext");
+    }
+
     /**
-     * 多路径获取 StandardContext，兼容 session 未创建、Spring Boot 内嵌 Tomcat、Facade 嵌套。
+     * 多路径获取 StandardContext，兼容 session 未创建、Spring Boot 内嵌、Request 包装、Facade 嵌套。
      */
     public static Object getStandardContext(HttpServletRequest request) throws Exception {
         Exception last = null;
+        Object unwrapped = unwrapToCatalinaRequest(request);
 
-        // 1) request.request.context (Catalina Request)
+        // 1) Catalina Request / RequestFacade -> context
         try {
-            Object coyoteReq = getFieldValue(request, "request");
-            if (coyoteReq != null) {
-                Object ctx = invoke(coyoteReq, "getContext", new Class[0]);
-                if (ctx != null && ctx.getClass().getName().contains("StandardContext")) {
-                    return ctx;
+            Object catalina = unwrapped;
+            // RequestFacade.request -> Request
+            if (catalina != null && catalina.getClass().getName().endsWith("RequestFacade")) {
+                try {
+                    Object inner = getFieldValue(catalina, "request");
+                    if (inner != null) {
+                        catalina = inner;
+                    }
+                } catch (Exception ignored) {
                 }
-                Object ctx2 = getFieldValue(coyoteReq, "context");
-                if (ctx2 != null && ctx2.getClass().getName().contains("StandardContext")) {
-                    return ctx2;
+            }
+            if (catalina != null) {
+                try {
+                    Object ctx = invokeName(catalina, "getContext");
+                    if (isStandardContext(ctx)) {
+                        return ctx;
+                    }
+                } catch (Exception ignored) {
+                }
+                try {
+                    Object ctx2 = getFieldValue(catalina, "context");
+                    if (isStandardContext(ctx2)) {
+                        return ctx2;
+                    }
+                } catch (Exception ignored) {
                 }
             }
         } catch (Exception e) {
@@ -137,9 +398,9 @@
 
         // 2) ServletContext facade 链
         try {
-            Object servletContext = request.getServletContext();
-            for (int i = 0; i < 6 && servletContext != null; i++) {
-                if (servletContext.getClass().getName().contains("StandardContext")) {
+            Object servletContext = servletContextOf(request);
+            for (int i = 0; i < 8 && servletContext != null; i++) {
+                if (isStandardContext(servletContext)) {
                     return servletContext;
                 }
                 Object nested = null;
@@ -150,7 +411,7 @@
                 if (nested == null) {
                     break;
                 }
-                if (nested.getClass().getName().contains("StandardContext")) {
+                if (isStandardContext(nested)) {
                     return nested;
                 }
                 servletContext = nested;
@@ -159,12 +420,12 @@
             last = e;
         }
 
-        // 3) session.getServletContext() 回退（可能新建 session）
+        // 3) session 回退
         try {
-            Object context = request.getSession().getServletContext();
+            Object context = servletContextOf(request);
             Object appContext = getFieldValue(context, "context");
             Object standardContext = getFieldValue(appContext, "context");
-            if (standardContext != null) {
+            if (isStandardContext(standardContext)) {
                 return standardContext;
             }
         } catch (Exception e) {
@@ -223,13 +484,79 @@
 
     public static String getFilterName(Object filterMap) throws Exception {
         Method m = findMethod(filterMap.getClass(), "getFilterName");
+        if (m == null) {
+            m = findCompatibleMethod(filterMap.getClass(), "getFilterName");
+        }
+        if (m == null) {
+            // 字段回退
+            Object v = getFieldValue(filterMap, "filterName");
+            return v == null ? null : String.valueOf(v);
+        }
         return (String) m.invoke(filterMap);
     }
 
     public static String[] getURLPatterns(Object filterMap) throws Exception {
+        // Tomcat 7+ : getURLPatterns()
         Method m = findMethod(filterMap.getClass(), "getURLPatterns");
-        Object r = m.invoke(filterMap);
-        return r == null ? new String[0] : (String[]) r;
+        if (m != null) {
+            Object r = m.invoke(filterMap);
+            return r == null ? new String[0] : (String[]) r;
+        }
+        // Tomcat 6 : getURLPattern() 单值
+        Method single = findMethod(filterMap.getClass(), "getURLPattern");
+        if (single != null) {
+            Object r = single.invoke(filterMap);
+            return r == null ? new String[0] : new String[]{String.valueOf(r)};
+        }
+        try {
+            Object arr = getFieldValue(filterMap, "urlPatterns");
+            if (arr instanceof String[]) {
+                return (String[]) arr;
+            }
+        } catch (Exception ignored) {
+        }
+        return new String[0];
+    }
+
+    /** 优先取已实例化 filter；否则回退 filterDef.filterClass（避免 lazy init 为 null 时漏报） */
+    public static Class<?> resolveFilterClass(Object appFilterConfig) throws Exception {
+        Object filter = null;
+        try {
+            filter = getFieldValue(appFilterConfig, "filter");
+        } catch (Exception ignored) {
+        }
+        if (filter != null) {
+            return filter.getClass();
+        }
+        Object filterDef = getFieldValue(appFilterConfig, "filterDef");
+        if (filterDef == null) {
+            return null;
+        }
+        String cn = null;
+        try {
+            Object v = invokeName(filterDef, "getFilterClass");
+            if (v != null) {
+                cn = String.valueOf(v);
+            }
+        } catch (Exception ignored) {
+        }
+        if (cn == null || cn.length() == 0) {
+            try {
+                Object v = getFieldValue(filterDef, "filterClass");
+                if (v != null) {
+                    cn = String.valueOf(v);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (cn == null || cn.length() == 0) {
+            return null;
+        }
+        try {
+            return loadClassFlexible(cn);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -470,21 +797,20 @@
 
     public static Object getWsContainer(HttpServletRequest request) {
         try {
-            Object sc = request.getServletContext();
+            Object sc = servletContextOf(request);
             String[] keys = new String[]{
                     "javax.websocket.server.ServerContainer",
                     "jakarta.websocket.server.ServerContainer"
             };
-            for (String key : keys) {
-                Object c = invoke(sc, "getAttribute", new Class[]{String.class}, key);
+            for (int i = 0; i < keys.length; i++) {
+                Object c = invokeName(sc, "getAttribute", keys[i]);
                 if (c != null) {
                     return c;
                 }
             }
-            // fallback Class.forName().getName()
             Class<?> c1 = tryClass("javax.websocket.server.ServerContainer", "jakarta.websocket.server.ServerContainer");
             if (c1 != null) {
-                return invoke(sc, "getAttribute", new Class[]{String.class}, c1.getName());
+                return invokeName(sc, "getAttribute", c1.getName());
             }
         } catch (Exception ignored) {
         }
@@ -524,11 +850,56 @@
         return null;
     }
 
+    public static Object getProtocolHandler(HttpServletRequest request) throws Exception {
+        Object catalina = unwrapToCatalinaRequest(request);
+        if (catalina != null && catalina.getClass().getName().endsWith("RequestFacade")) {
+            try {
+                Object inner = getFieldValue(catalina, "request");
+                if (inner != null) {
+                    catalina = inner;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        Object connector = null;
+        try {
+            connector = getFieldValue(catalina, "connector");
+        } catch (Exception ignored) {
+        }
+        if (connector == null) {
+            try {
+                connector = invokeName(catalina, "getConnector");
+            } catch (Exception ignored) {
+            }
+        }
+        if (connector == null) {
+            throw new IllegalStateException("无法获取 Connector（请求可能被严重包装）");
+        }
+        Object protocolHandler = null;
+        try {
+            protocolHandler = getFieldValue(connector, "protocolHandler");
+        } catch (Exception ignored) {
+        }
+        if (protocolHandler == null) {
+            protocolHandler = invokeName(connector, "getProtocolHandler");
+        }
+        return protocolHandler;
+    }
+
     public static Map<String, Object> getUpgradeProtocols(HttpServletRequest request) throws Exception {
-        Object coyoteReq = getFieldValue(request, "request");
-        Object connector = getFieldValue(coyoteReq, "connector");
-        Object protocolHandler = getFieldValue(connector, "protocolHandler");
-        Object map = getFieldValue(protocolHandler, "httpUpgradeProtocols");
+        Object protocolHandler = getProtocolHandler(request);
+        Object map = null;
+        try {
+            map = getFieldValue(protocolHandler, "httpUpgradeProtocols");
+        } catch (Exception ignored) {
+        }
+        if (map == null) {
+            // 部分版本在 AbstractHttp11Protocol 父类字段名一致，再尝试 getter
+            try {
+                map = invokeName(protocolHandler, "getUpgradeProtocols");
+            } catch (Exception ignored) {
+            }
+        }
         if (map instanceof Map) {
             @SuppressWarnings("unchecked")
             Map<String, Object> m = (Map<String, Object>) map;
@@ -538,25 +909,27 @@
     }
 
     public static Object getEndpoint(HttpServletRequest request) throws Exception {
-        Object coyoteReq = getFieldValue(request, "request");
-        Object connector = getFieldValue(coyoteReq, "connector");
-        Object protocolHandler = getFieldValue(connector, "protocolHandler");
-        // AbstractProtocol.endpoint
-        Object endpoint = null;
+        Object protocolHandler = null;
         try {
-            endpoint = getFieldValue(protocolHandler, "endpoint");
+            protocolHandler = getProtocolHandler(request);
         } catch (Exception ignored) {
         }
-        if (endpoint == null) {
+        Object endpoint = null;
+        if (protocolHandler != null) {
             try {
-                endpoint = invoke(protocolHandler, "getEndpoint", new Class[0]);
+                endpoint = getFieldValue(protocolHandler, "endpoint");
             } catch (Exception ignored) {
+            }
+            if (endpoint == null) {
+                try {
+                    endpoint = invokeName(protocolHandler, "getEndpoint");
+                } catch (Exception ignored) {
+                }
             }
         }
         if (endpoint != null) {
             return endpoint;
         }
-        // 回退：从 Poller/Acceptor 线程找 this$0
         return findEndpointFromThreads();
     }
 
@@ -571,7 +944,13 @@
                 continue;
             }
             try {
-                Object target = getFieldValue(t, "target");
+                Object target = null;
+                try {
+                    target = getFieldValue(t, "target");
+                } catch (Exception ignored) {
+                    // JDK17+ Thread.target 可能不可访问；忽略该回退路径
+                    continue;
+                }
                 if (target == null) {
                     continue;
                 }
@@ -588,15 +967,27 @@
         return null;
     }
 
-    public static Thread[] getAllThreads() throws Exception {
+    public static Thread[] getAllThreads() {
         ThreadGroup group = Thread.currentThread().getThreadGroup();
         while (group.getParent() != null) {
             group = group.getParent();
         }
-        int estimated = group.activeCount() * 2;
-        Thread[] threads = new Thread[Math.max(estimated, 64)];
-        int n = group.enumerate(threads, true);
-        return Arrays.copyOf(threads, n);
+        int estimated = Math.max(group.activeCount() * 2, 64);
+        Thread[] threads = new Thread[estimated];
+        int n;
+        for (int i = 0; i < 3; i++) {
+            n = group.enumerate(threads, true);
+            if (n < threads.length) {
+                Thread[] exact = new Thread[n];
+                System.arraycopy(threads, 0, exact, 0, n);
+                return exact;
+            }
+            threads = new Thread[threads.length * 2];
+        }
+        n = group.enumerate(threads, true);
+        Thread[] exact = new Thread[n];
+        System.arraycopy(threads, 0, exact, 0, n);
+        return exact;
     }
 
     public static List<TimerInfo> getTimerTasks() throws Exception {
@@ -676,17 +1067,30 @@
         } catch (Exception ignored) {
         }
 
-        Method removeFilterDef = findMethod(standardContext.getClass(), "removeFilterDef", clsFilterDef);
-        if (removeFilterDef != null) {
-            removeFilterDef.invoke(standardContext, filterDef);
+        if (clsFilterDef != null) {
+            Method removeFilterDef = findMethod(standardContext.getClass(), "removeFilterDef", clsFilterDef);
+            if (removeFilterDef != null) {
+                removeFilterDef.invoke(standardContext, filterDef);
+            } else {
+                invokeName(standardContext, "removeFilterDef", filterDef);
+            }
+        } else {
+            invokeName(standardContext, "removeFilterDef", filterDef);
         }
 
         Object[] filterMaps = getFilterMaps(standardContext);
-        Method removeFilterMap = findMethod(standardContext.getClass(), "removeFilterMap", clsFilterMap);
         for (Object filterMap : filterMaps) {
-            if (filterName.equals(getFilterName(filterMap)) && removeFilterMap != null) {
-                removeFilterMap.invoke(standardContext, filterMap);
+            if (!filterName.equals(getFilterName(filterMap))) {
+                continue;
             }
+            if (clsFilterMap != null) {
+                Method removeFilterMap = findMethod(standardContext.getClass(), "removeFilterMap", clsFilterMap);
+                if (removeFilterMap != null) {
+                    removeFilterMap.invoke(standardContext, filterMap);
+                    continue;
+                }
+            }
+            invokeName(standardContext, "removeFilterMap", filterMap);
         }
 
         // 兜底清理 filterConfigs / filterDefs（原注释中的遗留问题）
@@ -722,9 +1126,23 @@
         }
         if (objChild != null) {
             Class<?> containerCls = tryClass("org.apache.catalina.Container");
-            Method removeChild = findMethod(standardContext.getClass(), "removeChild", containerCls);
+            Method removeChild = containerCls == null ? null
+                    : findMethod(standardContext.getClass(), "removeChild", containerCls);
             if (removeChild != null) {
                 removeChild.invoke(standardContext, objChild);
+            } else {
+                invokeName(standardContext, "removeChild", objChild);
+            }
+            // destroy servlet instance if present
+            try {
+                Object servlet = invokeName(objChild, "getServlet");
+                if (servlet != null) {
+                    Method destroy = findCompatibleMethod(servlet.getClass(), "destroy");
+                    if (destroy != null) {
+                        destroy.invoke(servlet);
+                    }
+                }
+            } catch (Exception ignored) {
             }
         }
     }
@@ -783,7 +1201,6 @@
             if (val instanceof List) {
                 @SuppressWarnings("unchecked")
                 List<Object> list = (List<Object>) val;
-                Iterator<Object> it = list.iterator();
                 // CopyOnWriteArrayList iterator 不支持 remove，重建
                 List<Object> kept = new CopyOnWriteArrayList<Object>();
                 for (Object o : list) {
@@ -931,14 +1348,39 @@
         if (tpe == null) {
             throw new IllegalStateException("找不到 org.apache.tomcat.util.threads.ThreadPoolExecutor");
         }
-        Constructor<?> ctor = tpe.getConstructor(
-                int.class, int.class, long.class, TimeUnit.class,
-                Class.forName("java.util.concurrent.BlockingQueue"),
-                Class.forName("java.util.concurrent.ThreadFactory"),
-                Class.forName("java.util.concurrent.RejectedExecutionHandler"));
-        Object fresh = ctor.newInstance(Integer.valueOf(core), Integer.valueOf(max),
-                Long.valueOf(keepAlive), TimeUnit.MILLISECONDS, queue, threadFactory, handler);
-        invoke(endpoint, "setExecutor", new Class[]{Class.forName("java.util.concurrent.Executor")}, fresh);
+        Class<?> bq = tryClass("java.util.concurrent.BlockingQueue");
+        Class<?> tf = tryClass("java.util.concurrent.ThreadFactory");
+        Class<?> rh = tryClass("java.util.concurrent.RejectedExecutionHandler");
+        Class<?> execIface = tryClass("java.util.concurrent.Executor");
+        Object fresh = null;
+        Constructor<?>[] ctors = tpe.getConstructors();
+        for (int i = 0; i < ctors.length; i++) {
+            Class<?>[] pts = ctors[i].getParameterTypes();
+            try {
+                if (pts.length == 7 && bq != null && tf != null && rh != null) {
+                    fresh = ctors[i].newInstance(Integer.valueOf(core), Integer.valueOf(max),
+                            Long.valueOf(keepAlive), TimeUnit.MILLISECONDS, queue, threadFactory, handler);
+                    break;
+                }
+                if (pts.length == 6 && bq != null && tf != null) {
+                    fresh = ctors[i].newInstance(Integer.valueOf(core), Integer.valueOf(max),
+                            Long.valueOf(keepAlive), TimeUnit.MILLISECONDS, queue, threadFactory);
+                    break;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        if (fresh == null) {
+            throw new IllegalStateException("无法构造标准 ThreadPoolExecutor，请手工恢复");
+        }
+        if (execIface != null) {
+            Method setExec = findMethod(endpoint.getClass(), "setExecutor", execIface);
+            if (setExec != null) {
+                setExec.invoke(endpoint, fresh);
+                return;
+            }
+        }
+        invokeName(endpoint, "setExecutor", fresh);
     }
 
     public static String classFilePath(Class<?> clazz) {
@@ -1019,13 +1461,15 @@
             if (lookup == null) {
                 lookup = findMethod(repo, "lookupClass", String.class);
             }
-            Object javaClass = lookup.getParameterTypes()[0] == Class.class
-                    ? lookup.invoke(null, clazz)
-                    : lookup.invoke(null, clazz.getName());
-            if (javaClass != null) {
-                Method getBytes = findMethod(javaClass.getClass(), "getBytes");
-                if (getBytes != null) {
-                    return (byte[]) getBytes.invoke(javaClass);
+            if (lookup != null) {
+                Object javaClass = lookup.getParameterTypes()[0] == Class.class
+                        ? lookup.invoke(null, clazz)
+                        : lookup.invoke(null, clazz.getName());
+                if (javaClass != null) {
+                    Method getBytes = findMethod(javaClass.getClass(), "getBytes");
+                    if (getBytes != null) {
+                        return (byte[]) getBytes.invoke(javaClass);
+                    }
                 }
             }
         }
@@ -1057,21 +1501,21 @@
         return sb.toString();
     }
 
-    public static void writeTableStart(JspWriter out, String title, String tip, String[] headers) throws Exception {
-        out.write("<h4 style=\"margin:18px 0 6px\">" + html(title) + "</h4>");
+    public static void writeTableStart(Object out, String title, String tip, String[] headers) throws Exception {
+        writeOut(out, "<h4 style=\"margin:18px 0 6px\">" + html(title) + "</h4>");
         if (tip != null && tip.length() > 0) {
-            out.write("<div style=\"color:#666;font-size:12px;margin-bottom:6px\">" + tip + "</div>");
+            writeOut(out, "<div style=\"color:#666;font-size:12px;margin-bottom:6px\">" + tip + "</div>");
         }
-        out.write("<table border=\"1\" cellspacing=\"0\" width=\"98%\" style=\"table-layout:fixed;word-break:break-all;background:#f7f7f7;font-size:13px\">");
-        out.write("<thead><tr>");
+        writeOut(out, "<table border=\"1\" cellspacing=\"0\" width=\"98%\" style=\"table-layout:fixed;word-break:break-all;background:#f7f7f7;font-size:13px\">");
+        writeOut(out, "<thead><tr>");
         for (String h : headers) {
-            out.write("<th>" + html(h) + "</th>");
+            writeOut(out, "<th>" + html(h) + "</th>");
         }
-        out.write("</tr></thead><tbody>");
+        writeOut(out, "</tr></thead><tbody>");
     }
 
-    public static void writeTableEnd(JspWriter out) throws Exception {
-        out.write("</tbody></table>");
+    public static void writeTableEnd(Object out) throws Exception {
+        writeOut(out, "</tbody></table>");
     }
 
     public static String dumpLink(String className) {
@@ -1164,12 +1608,16 @@
     if ("dump".equals(action) && request.getParameter("className") != null) {
         String className = request.getParameter("className");
         try {
-            Class<?> clazz = Class.forName(className);
+            try {
+                out.clear();
+            } catch (Exception ignored) {
+            }
+            Class<?> clazz = loadClassFlexible(className);
             byte[] classBytes = dumpClassBytes(clazz);
-            response.reset();
+            response.resetBuffer();
             response.setContentType("application/octet-stream");
             String filename = clazz.getSimpleName();
-            if (filename == null || filename.length() == 0) {
+            if (filename == null || filename.length() == 0 || "null".equals(filename)) {
                 filename = "MemShell";
             }
             filename = filename + ".class";
@@ -1181,13 +1629,30 @@
                 response.setHeader("Content-Disposition",
                         "attachment;filename=" + URLEncoder.encode(filename, "UTF-8"));
             }
-            ServletOutputStream sos = response.getOutputStream();
-            sos.write(classBytes);
-            sos.flush();
-            sos.close();
+            // 避免依赖 ServletOutputStream 编译期类型名差异：反射写出
+            Object sos = invokeName(response, "getOutputStream");
+            Method write = findMethod(sos.getClass(), "write", byte[].class);
+            if (write == null) {
+                write = findMethod(sos.getClass(), "write", byte[].class, int.class, int.class);
+            }
+            if (write == null) {
+                throw new IllegalStateException("OutputStream.write 不可用");
+            }
+            if (write.getParameterTypes().length == 1) {
+                write.invoke(sos, new Object[]{classBytes});
+            } else {
+                write.invoke(sos, new Object[]{classBytes, Integer.valueOf(0), Integer.valueOf(classBytes.length)});
+            }
+            try {
+                invokeName(sos, "flush");
+            } catch (Exception ignored) {
+            }
             return;
         } catch (Exception e) {
-            response.reset();
+            try {
+                response.reset();
+            } catch (Exception ignored) {
+            }
             response.setContentType("text/html;charset=UTF-8");
             out.write("<h3>dump 失败</h3><pre class=\"err\">" + html(e.toString()) + "</pre>");
             out.write("<p>内存中动态定义的类可能无法通过 ClassLoader/BCEL dump，可使用 Arthas：</p>");
@@ -1202,7 +1667,8 @@
     目标：扫描并查杀 Tomcat 内存马 &nbsp;|&nbsp;
     运行环境：<%=html(tomcatInfo)%> &nbsp;|&nbsp;
     Context：<%=html(contextName)%> &nbsp;|&nbsp;
-    JDK：<%=html(System.getProperty("java.version"))%>
+    JDK：<%=html(System.getProperty("java.version"))%><br/>
+    适配：Tomcat 7–11 / Spring Boot 内嵌（javax &amp; jakarta）；请求包装自动解包；反射失败单模块降级，不拖垮整页。
 </div>
 
 <%
@@ -1220,11 +1686,26 @@
             if (appFilterConfig == null) {
                 continue;
             }
-            Object filter = getFieldValue(appFilterConfig, "filter");
-            if (filter == null) {
+            Class<?> fc = resolveFilterClass(appFilterConfig);
+            if (fc == null) {
+                // 仍展示 filterDef 类名，避免 lazy 未初始化时整行消失
+                try {
+                    Object filterDef = getFieldValue(appFilterConfig, "filterDef");
+                    Object cn = filterDef == null ? null : invokeName(filterDef, "getFilterClass");
+                    fid++;
+                    out.write("<tr>");
+                    out.write("<td style=\"text-align:center\">" + fid + "</td>");
+                    out.write("<td>" + html(fname) + "</td>");
+                    out.write("<td>" + html(arrayToString(getURLPatterns(fm))) + "</td>");
+                    out.write("<td>" + html(cn) + " <span style=\"color:#999\">(未实例化)</span></td>");
+                    out.write("<td>-</td><td>-</td><td>类尚未加载</td>");
+                    out.write("<td style=\"text-align:center;color:#999\">-</td>");
+                    out.write("<td style=\"text-align:center\"><a href=\"" + killLink("filterName=" + URLEncoder.encode(fname, "UTF-8")) + "\">kill</a></td>");
+                    out.write("</tr>");
+                } catch (Exception ignored) {
+                }
                 continue;
             }
-            Class<?> fc = filter.getClass();
             fid++;
             out.write("<tr>");
             out.write("<td style=\"text-align:center\">" + fid + "</td>");
@@ -1259,13 +1740,15 @@
             }
             Class<?> servletClass = null;
             try {
-                String cn = String.valueOf(invoke(wrapper, "getServletClass", new Class[0]));
-                servletClass = Class.forName(cn, false, Thread.currentThread().getContextClassLoader());
+                String cn = String.valueOf(invokeName(wrapper, "getServletClass"));
+                if (cn != null && !"null".equals(cn) && cn.length() > 0) {
+                    servletClass = loadClassFlexible(cn);
+                }
             } catch (Exception ignored) {
             }
             if (servletClass == null) {
                 try {
-                    Object servlet = invoke(wrapper, "getServlet", new Class[0]);
+                    Object servlet = invokeName(wrapper, "getServlet");
                     if (servlet != null) {
                         servletClass = servlet.getClass();
                     }
@@ -1389,7 +1872,7 @@
     try {
         List<TimerInfo> timers = getTimerTasks();
         writeTableStart(out, "Timer",
-                "基于 java.util.TimerThread 的定时内存马；kill 会 cancel 队列任务并中断该 Timer 线程",
+                "基于 java.util.TimerThread；JDK16+ 若开启强封装，访问 Timer 内部字段可能失败（需 --add-opens java.base/java.util=ALL-UNNAMED）",
                 new String[]{"ID", "Thread", "TimerTask class", "ClassLoader", "Class path", "Judge", "dump", "kill"});
         int tid = 0;
         for (TimerInfo info : timers) {
@@ -1407,11 +1890,12 @@
             out.write("</tr>");
         }
         if (tid == 0) {
-            out.write("<tr><td colspan=\"8\" style=\"text-align:center;color:#666\">未发现 TimerTask</td></tr>");
+            out.write("<tr><td colspan=\"8\" style=\"text-align:center;color:#666\">未发现 TimerTask（或当前 JDK 限制了 Timer 内部反射）</td></tr>");
         }
         writeTableEnd(out);
     } catch (Exception e) {
-        out.write("<div class=\"err\">Timer 扫描失败: " + html(e.toString()) + "</div>");
+        out.write("<div class=\"err\">Timer 扫描失败: " + html(e.toString())
+                + "；若为 InaccessibleObjectException，请为 JVM 增加 --add-opens java.base/java.util=ALL-UNNAMED</div>");
     }
 
     // -------- Upgrade --------
@@ -1479,7 +1963,7 @@
 %>
 <p style="margin-top:20px;color:#888;font-size:12px">
     tomcat-memshell-scanner <%=VERSION%> —
-    基于 c0ny1/java-memshell-scanner，增强兼容性与查杀能力。仅用于授权应急响应。
+    基于 c0ny1/java-memshell-scanner，增强多版本兼容与查杀稳定性。仅用于授权应急响应。
 </p>
 </body>
 </html>

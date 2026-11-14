@@ -4,7 +4,7 @@
 
 将 `tomcat-memshell-scanner.jsp` 部署到目标 Web 应用后访问即可。**仅用于授权应急响应。**
 
-## 当前版本 0.2.0
+## 当前版本 0.2.1
 
 ### 支持类型
 
@@ -21,17 +21,20 @@
 
 ### 兼容性改进
 
-- 反射获取 `StandardContext`（request / ServletContext facade / session 多路径）
-- 尽量避免对 Tomcat / WebSocket 类型的硬编码 import，降低 Tomcat 7–10+、javax/jakarta 编译差异
-- Filter / Servlet 的 Map 按接口读取，兼容 `HashMap` / `ConcurrentHashMap`
-- Listener 兼容 `applicationEventListenersList` 与 `*ListenersObjects` 等字段差异
-- class dump：ClassLoader 资源 → BCEL（若存在）→ 失败时提示 Arthas
+- 反射获取 `StandardContext`（Catalina Request / Facade / ServletContext / session 多路径）
+- 自动解包 Spring/Filter 的 RequestWrapper，降低内嵌 Tomcat 取 Context 失败概率
+- `trySetAccessible` + 按实参兼容查找方法，减少 Tomcat 版本间方法签名差异导致的失败
+- 避免硬编码 Tomcat / WebSocket 类型；WebSocket 属性兼容 javax / jakarta
+- FilterMap URL：兼容 Tomcat 6 的 `getURLPattern()` 与 7+ 的 `getURLPatterns()`
+- Filter 未实例化时回退展示 `filterDef.filterClass`，避免漏报
+- class dump：多 ClassLoader 加载 → 资源流 → BCEL → Arthas 提示；写出流用反射，降低 API 包名差异
 - 分区 try/catch，单模块失败不中断整页扫描
-- 按 class 资源位置给出可疑度提示（无磁盘 class / work 目录等）
+- JDK16+ 访问 `java.util.Timer` 内部字段可能被模块系统拦截，页面会提示 `--add-opens`
 
 ### 已知限制
 
 - Agent / `redefineClasses` 型内存马无法通过本 JSP 卸载
 - 纯内存 defineClass 且无磁盘资源时，dump 可能失败
 - Spring MVC Interceptor / Controller 需另行排查
+- 非 Tomcat 容器（Jetty / Undertow / WebLogic 等）不在本 JSP 覆盖范围
 - 学习/应急产物，请在隔离环境验证后再用于生产
