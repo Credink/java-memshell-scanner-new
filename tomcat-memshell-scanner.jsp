@@ -436,26 +436,43 @@
     }
 
     public static String detectTomcatInfo(Object standardContext) {
+        String base = null;
         try {
             Package p = standardContext.getClass().getPackage();
             String impl = p != null ? p.getImplementationVersion() : null;
             if (impl != null && impl.length() > 0) {
-                return "Tomcat " + impl;
+                base = "Tomcat " + impl;
             }
         } catch (Exception ignored) {
         }
-        String serverInfo = "";
-        try {
-            Method m = findMethod(standardContext.getClass(), "getServerInfo");
-            if (m != null) {
-                serverInfo = String.valueOf(m.invoke(standardContext));
+        if (base == null) {
+            try {
+                Method m = findMethod(standardContext.getClass(), "getServerInfo");
+                if (m != null) {
+                    Object v = m.invoke(standardContext);
+                    if (v != null && String.valueOf(v).length() > 0) {
+                        base = String.valueOf(v);
+                    }
+                }
+            } catch (Exception ignored) {
             }
-        } catch (Exception ignored) {
         }
-        boolean jakarta = tryClass("jakarta.servlet.Servlet") != null
-                && tryClass("javax.servlet.Servlet") == null;
-        return (serverInfo.length() > 0 ? serverInfo : "Tomcat")
-                + (jakarta ? " (Jakarta EE / Tomcat 10+)" : " (Java EE / javax)");
+        if (base == null) {
+            base = "Tomcat";
+        }
+        boolean hasJakarta = tryClass("jakarta.servlet.Servlet") != null;
+        boolean hasJavax = tryClass("javax.servlet.Servlet") != null;
+        String api;
+        if (hasJakarta && !hasJavax) {
+            api = "Jakarta EE";
+        } else if (hasJavax && !hasJakarta) {
+            api = "Java EE / javax";
+        } else if (hasJakarta) {
+            api = "Jakarta+javax";
+        } else {
+            api = "servlet-api unknown";
+        }
+        return base + " (" + api + ")";
     }
 
     @SuppressWarnings("unchecked")
